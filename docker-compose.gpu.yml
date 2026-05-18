@@ -1,0 +1,15 @@
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile dev up --build
+#
+# On CPU-only machines, just run the base file:
+#   docker compose --profile dev up --build
+
+services:
+  backend:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

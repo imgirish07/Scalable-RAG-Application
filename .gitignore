@@ -1,0 +1,69 @@
+# Environment
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+env/
+
+# Python 
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Data & Logs
+data/*
+!data/.gitkeep
+*.log
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Large model weight files (safeguard if outside /models/)
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.onnx
+
+# IDE & AI tool configs
+.vscode/
+.idea/
+.cursor/
+.cursorrules
+.windsurfrules
+.claude/
+.mcp.json
+.opencode.json
+
+# AI tool instruction files
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Models
+/models/
+# Added by code-review-graph
+.code-review-graph/
+
+#backup file
+backup_file.py
