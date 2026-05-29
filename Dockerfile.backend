@@ -1,3 +1,12 @@
+# syntax=docker/dockerfile:1.7
+#
+# Scalable RAG Backend — slim Python base, GPU via pip-installed NVIDIA libs.
+#
+# torch pulls in nvidia-cudnn-cu12, nvidia-cuda-runtime-cu12, etc. as deps.
+# onnxruntime-gpu reuses those same libs. We register them via ldconfig so
+# the dynamic linker finds them without relying on LD_LIBRARY_PATH.
+# Falls back to CPU automatically when no GPU is attached.
+
 ARG PYTHON_VERSION=3.12
 
 # ----- Stage 1: builder -----

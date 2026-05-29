@@ -1,66 +1,83 @@
 # Scalable RAG — Backend
 
-FastAPI layer wrapping the RAG pipeline. API-key auth, Postgres-backed users.
+FastAPI layer wrapping the RAG pipeline.
+
+> **Auth status:** Removed in Phase 0 to unblock a clean endpoint rebuild.
+> Every endpoint is currently unauthenticated. Auth (JWT + API keys) returns in Phase 8 — see [PLAN.md](../PLAN.md).
 
 ## Endpoints
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| GET  | `/healthz` | none | Liveness |
-| GET  | `/readyz`  | none | Readiness (waits for pipeline.initialize()) |
-| GET  | `/metrics` | none | Prometheus exposition |
-| POST | `/v1/auth/keys` | bootstrap token | Issue an API key |
-| POST | `/v1/query` | API key | Synchronous RAG query |
-| POST | `/v1/ingest` | API key | Multipart upload + ingest |
-| GET  | `/v1/collections` | API key | List configured collections |
+| Method | Path              | Purpose                                  |
+|--------|-------------------|------------------------------------------|
+| GET    | `/healthz`        | Liveness                                 |
+| GET    | `/readyz`         | Readiness (waits for `pipeline.initialize()`) |
+| GET    | `/metrics`        | Prometheus exposition                    |
+| POST   | `/v1/query`       | Synchronous RAG query                    |
+| POST   | `/v1/ingest`      | Multipart upload + ingest                |
+| GET    | `/v1/collections` | List configured collections              |
 
 ## Quickstart
 
 ```powershell
 Copy-Item .env.example .env
-# Set GROQ_API_KEY or GEMINI_API_KEY, and BACKEND_BOOTSTRAP_TOKEN.
+# Set GROQ_API_KEY or GEMINI_API_KEY.
 
 docker compose --profile dev up --build
-docker compose exec backend alembic -c backend/migrations/alembic.ini upgrade head
 
-# Issue a key
-curl -X POST http://localhost:8000/v1/auth/keys `
-  -H "X-Bootstrap-Token: $env:BACKEND_BOOTSTRAP_TOKEN" `
-  -H "Content-Type: application/json" `
-  -d '{\"email\":\"me@example.com\",\"name\":\"dev\"}'
-
-# Ingest
 curl -X POST http://localhost:8000/v1/ingest `
-  -H "Authorization: Bearer rag_YOUR_KEY" `
   -F "file=@./data/sample_docs/your-file.pdf" `
   -F "collection=my-docs"
 
-# Query
 curl -X POST http://localhost:8000/v1/query `
-  -H "Authorization: Bearer rag_YOUR_KEY" `
   -H "Content-Type: application/json" `
   -d '{\"query\":\"summarize this\",\"collection\":\"my-docs\",\"top_k\":5}'
 ```
 
-## Layout
+## Layout (MVCR + Service layer)
 
 ```
 backend/
-├── main.py            FastAPI app + lifespan
-├── config.py          BackendSettings
-├── deps.py            get_pipeline, get_db, get_principal
-├── auth/              Principal, API-key hashing
-├── middleware/        request_id + access log
-├── routers/           health, auth, query, ingest, collections
-├── repos/             Async SQLAlchemy: users, api_keys
-├── models/            Pydantic API shapes
-├── observability/     Prometheus metrics
-└── migrations/        Alembic
+├── main.py                 FastAPI app factory + lifespan
+├── settings.py             BackendSettings (env-driven config)
+├── dependencies.py         FastAPI Depends providers (get_pipeline)
+├── middleware.py           HTTP middleware (request-id, access log)
+├── metrics.py              Prometheus counters and histograms
+│
+├── api/v1/                 Controllers — HTTP route handlers
+│   ├── health.py
+│   ├── query.py
+│   ├── documents.py        (POST /v1/ingest today; /v1/documents in Phase 2)
+│   └── collections.py
+│
+├── schemas/                Pydantic request + response DTOs
+│   ├── common.py
+│   ├── query.py            QueryRequest
+│   ├── document.py         DocumentCreatedView
+│   └── collection.py       CollectionView, CollectionListView
+│
+├── models/                 SQLAlchemy ORM entities (populated in Phase 2+)
+│   └── base.py             class Base(DeclarativeBase)
+│
+├── repositories/           Data access (only layer that writes ORM queries)
+│   └── database.py         engine, session factory, session_scope
+│
+├── services/               Business logic (populated in Phase 2+)
+└── db/                     SQL migrations + runner (populated in Phase 2+)
 ```
 
 ## Operational notes
 
 - First boot: ~30-90 s (pip install + pipeline warmup). Watch for `Backend ready in N ms`.
 - `/readyz` returns 503 until warmup completes.
-- API keys are shown once on issuance; only the SHA-256 hash is stored.
 - Set `RERANKER_ENABLED=false` if cross-encoder model files aren't available.
+- All requests currently run as the hardcoded `dev-user` while auth is removed.
+
+## Class-naming conventions inside `schemas/`
+
+| Suffix         | Direction | Example                       |
+|----------------|-----------|-------------------------------|
+| `*Request`     | Inbound   | `QueryRequest`                |
+| `*Filter`      | Inbound   | (Phase 4) `DocumentFilter`    |
+| `*View`        | Outbound  | `CollectionView`              |
+| `*ListView`    | Outbound  | `CollectionListView`          |
+| `*CreatedView` | Outbound  | `DocumentCreatedView`         |

@@ -5,7 +5,12 @@
 #   postgres  — Users + API keys (also visible in pgAdmin on localhost:5432)
 #   redis     — Cache
 #   backend   — FastAPI app
-
+#
+# Both docker and bare-metal modes use the same Postgres container.
+#   docker mode  → backend container talks to compose service `postgres:5432`
+#   native mode  → uvicorn on host talks to `localhost:5432` (compose exposes it)
+#   pgAdmin      → connect to localhost:5432 to inspect data
+#
 # Usage:
 #   1. Copy .env.example to .env and set POSTGRES_* + LLM keys + bootstrap token.
 #   2. docker compose --profile dev up --build
@@ -52,14 +57,7 @@ services:
     profiles: ["dev", "full"]
     ports:
       - "6379:6379"
-    command:
-      [
-        "redis-server",
-        "--maxmemory",
-        "256mb",
-        "--maxmemory-policy",
-        "allkeys-lru",
-      ]
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -103,6 +101,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:
