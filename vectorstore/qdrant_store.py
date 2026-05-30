@@ -403,6 +403,7 @@ class QdrantStore(BaseVectorStore):
         "metadata.chunk_id",
         "metadata.user_id",
         "metadata.collection",
+        "metadata.doc_id",
     )
 
     def _ensure_payload_indexes(self) -> None:
@@ -1063,13 +1064,26 @@ class QdrantStore(BaseVectorStore):
         user's own corpus). When provided, results are narrowed to that group.
 
         Args:
-            user_id: User ID to filter by. None means no per-user scoping.
+            user_id: User ID to filter by. None means no per-user scoping
+                (reserved for admin operations like the post-ingest HNSW warmup).
+                Empty string is rejected — it almost always indicates a caller
+                that forgot to propagate identity, which would silently leak
+                across tenants.
             collection: Logical collection name to filter by. None means search
                 across all of the user's logical collections.
 
         Returns:
             Qdrant Filter object, or None when neither argument is provided.
+
+        Raises:
+            ValueError: If `user_id` is an empty string.
         """
+        if user_id is not None and not user_id:
+            raise ValueError(
+                "user_id was passed as empty string; pass None for explicit admin "
+                "queries or a real user_id for tenant-scoped queries"
+            )
+
         conditions: list[FieldCondition] = []
 
         if user_id:
@@ -1303,6 +1317,36 @@ class QdrantStore(BaseVectorStore):
             raise
 
     # Admin operations
+
+    async def delete_by_doc_id(self, doc_id: str) -> None:
+        """Delete every point whose payload.metadata.doc_id matches.
+
+        Used on user-initiated soft-delete and on terminal ingestion failure.
+        Idempotent — Qdrant succeeds with zero matches.
+        """
+        match_filter = Filter(
+            must=[FieldCondition(
+                key="metadata.doc_id",
+                match=MatchValue(value=doc_id),
+            )]
+        )
+        try:
+            await asyncio.to_thread(
+                self._client.delete,
+                collection_name=self.collection_name,
+                points_selector=match_filter,
+                wait=True,
+            )
+            logger.info(
+                "Qdrant points deleted | collection=%s | doc_id=%s",
+                self.collection_name, doc_id,
+            )
+        except Exception:
+            logger.exception(
+                "delete_by_doc_id failed | collection=%s | doc_id=%s",
+                self.collection_name, doc_id,
+            )
+            raise
 
     async def delete_collection(self) -> None:
         """Permanently delete the entire Qdrant collection.
