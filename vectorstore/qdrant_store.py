@@ -160,7 +160,7 @@ class QdrantStore(BaseVectorStore):
             Exception: If connection or collection creation fails.
         """
         try:
-            self._client = self._build_client()
+            self._client = await asyncio.to_thread(self._build_client)
 
             # Collection creation is sync — offload to thread to avoid blocking.
             await asyncio.to_thread(self._create_collection_if_missing)
@@ -1149,7 +1149,8 @@ class QdrantStore(BaseVectorStore):
             return []
 
         try:
-            embeddings_model = get_embeddings()
+            
+            embeddings_model = await asyncio.to_thread(get_embeddings)
             query_vector = await asyncio.to_thread(
                 embeddings_model.embed_query, query
             )
@@ -1243,9 +1244,10 @@ class QdrantStore(BaseVectorStore):
             return []
 
         try:
-            # Compute dense and sparse embeddings in parallel — independent operations.
-            embeddings_model = get_embeddings()
-            sparse_model = self._get_sparse_embeddings()
+            embeddings_model, sparse_model = await asyncio.gather(
+                asyncio.to_thread(get_embeddings),
+                asyncio.to_thread(self._get_sparse_embeddings),
+            )
 
             query_vector, sparse_vector = await asyncio.gather(
                 asyncio.to_thread(embeddings_model.embed_query, query),
@@ -1322,7 +1324,9 @@ class QdrantStore(BaseVectorStore):
         """Delete every point whose payload.metadata.doc_id matches.
 
         Used on user-initiated soft-delete and on terminal ingestion failure.
-        Idempotent — Qdrant succeeds with zero matches.
+        Idempotent — succeeds with zero matches, AND silently no-ops if the
+        collection itself does not exist yet (e.g. failure during the very
+        first ingest, before any successful upsert created the collection).
         """
         match_filter = Filter(
             must=[FieldCondition(
@@ -1341,7 +1345,14 @@ class QdrantStore(BaseVectorStore):
                 "Qdrant points deleted | collection=%s | doc_id=%s",
                 self.collection_name, doc_id,
             )
-        except Exception:
+        except Exception as exc:
+            if "doesn't exist" in str(exc).lower() or "not found" in str(exc).lower():
+                logger.info(
+                    "Qdrant delete skipped — collection does not exist yet "
+                    "| collection=%s | doc_id=%s",
+                    self.collection_name, doc_id,
+                )
+                return
             logger.exception(
                 "delete_by_doc_id failed | collection=%s | doc_id=%s",
                 self.collection_name, doc_id,
