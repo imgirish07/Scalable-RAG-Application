@@ -1,14 +1,4 @@
-"""HTTP endpoints for the documents resource.
-
-Architecture-A flow:
-  POST   /v1/ingest                          start ingestion → presigned URL
-  POST   /v1/documents/{doc_id}/finalize     trigger background ingestion
-  GET    /v1/documents/{doc_id}/events       SSE stream of ingestion progress
-  POST   /v1/documents/{doc_id}/retry        re-run a failed ingestion (DLQ)
-  GET    /v1/documents                       list with filters
-  GET    /v1/documents/{doc_id}              single doc detail
-  DELETE /v1/documents/{doc_id}              soft-delete + cascade
-"""
+"""HTTP endpoints for the documents resource: upload sessions, finalize/retry, SSE progress, list/get/delete."""
 
 import asyncio
 import json
@@ -21,6 +11,7 @@ from backend.dependencies import get_current_user_id
 from backend.schemas.document import (
     DocumentDetailView,
     DocumentListView,
+    DownloadView,
     FinalizeAck,
     UploadSessionRequest,
     UploadSessionView,
@@ -33,7 +24,6 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["documents"])
 
 
-# SSE protocol bits.
 _SSE_KEEPALIVE_INTERVAL_S = 15.0
 
 
@@ -92,11 +82,7 @@ async def stream_events(
     user_id: str = Depends(get_current_user_id),
     service: DocumentService = Depends(get_document_service),
 ) -> StreamingResponse:
-    """Server-Sent Events stream of ingestion progress for a single doc.
-
-    Eagerly fetches the first event (snapshot) so tenancy errors surface as
-    proper HTTP status codes BEFORE the StreamingResponse is committed.
-    """
+    """SSE stream of ingestion progress; first event is fetched eagerly so tenancy errors surface as HTTP status before StreamingResponse commits."""
     event_iter = service.subscribe_to_events(doc_id=doc_id, user_id=user_id)
     try:
         first_event = await event_iter.__anext__()
@@ -139,6 +125,16 @@ async def get_document(
     return await service.get(doc_id=doc_id, user_id=user_id)
 
 
+@router.get("/documents/{doc_id}/download", response_model=DownloadView)
+async def get_document_download_url(
+    doc_id: str,
+    user_id: str = Depends(get_current_user_id),
+    service: DocumentService = Depends(get_document_service),
+) -> DownloadView:
+    """Return a short-lived presigned GET URL the browser can fetch from MinIO."""
+    return await service.get_download_url(doc_id=doc_id, user_id=user_id)
+
+
 @router.delete("/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(
     doc_id: str,
@@ -150,12 +146,7 @@ async def delete_document(
 
 
 async def _sse_stream(first_event, event_iter):
-    """SSE wire format wrapper with a pre-fetched first event.
-
-    Uses `asyncio.wait` (not `wait_for`) for the keepalive timeout so the
-    pending `__anext__` task is NOT cancelled on each idle interval — that
-    would close the underlying generator and end the stream prematurely.
-    """
+    """SSE wire-format wrapper; uses `asyncio.wait` (not `wait_for`) so the pending `__anext__` is not cancelled on each idle interval."""
     next_task = None
     try:
         if first_event is not None:

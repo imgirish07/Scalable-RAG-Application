@@ -1,37 +1,51 @@
 import { create } from 'zustand'
 import {
   createUploadSession,
+  deleteDocument,
   finalizeUpload,
   putBytesToPresignedUrl,
+  retryIngestion,
 } from '../api/documents.js'
 import { apiBaseUrl } from '../api/client.js'
 import { openDocumentEventStream } from '../api/sse.js'
 
-// Job lifecycle: queued → uploading → processing → ready|failed
-const newJob = (file, collection) => ({
+const TERMINAL_STATUSES = new Set(['ready', 'failed', 'duplicate'])
+
+const newJob = (file, collection, conversationId) => ({
   id: crypto.randomUUID(),
   file,
   filename: file.name,
   size: file.size,
   mimeType: file.type || 'application/octet-stream',
   collection,
+  conversationId: conversationId || null,
   docId: null,
   status: 'queued',
+  phase: 'queued',
   progress: 0,
   message: '',
+  chunksProcessed: 0,
+  chunksTotal: 0,
+  etaMs: null,
+  duplicateOf: null,
+  errorReason: null,
+  durationMs: null,
 })
 
 export const useUploadStore = create((set, get) => ({
   jobs: [],
   _running: false,
 
-  addFiles(files, collection) {
-    const additions = Array.from(files).map((f) => newJob(f, collection))
+  addFiles(files, collection, conversationId = null) {
+    const additions = Array.from(files).map((f) =>
+      newJob(f, collection, conversationId),
+    )
     set((s) => ({ jobs: [...s.jobs, ...additions] }))
   },
 
-  // Drain the queue sequentially. Indexing is expensive — parallel uploads
-  // would hammer the backend embedder. Guarded so rapid double-clicks are no-ops.
+  // Drains upload+finalize sequentially (cheap I/O). Arq enforces serial ingestion
+  // downstream, so we don't gate the queue on the SSE wait — that would freeze
+  // every subsequent upload behind the active ingest job.
   async start() {
     if (get()._running) return
     set({ _running: true })
@@ -46,17 +60,54 @@ export const useUploadStore = create((set, get) => ({
     }
   },
 
-  removeJob(jobId) {
+  async removeJob(jobId) {
+    const job = get().jobs.find((j) => j.id === jobId)
     set((s) => ({ jobs: s.jobs.filter((j) => j.id !== jobId) }))
+    if (job?.docId && !TERMINAL_STATUSES.has(job.status)) {
+      try { await deleteDocument(job.docId) } catch { /* sweeper will reap */ }
+    }
   },
 
-  retryJob(jobId) {
-    get()._update(jobId, { status: 'queued', progress: 0, message: '' })
+  async retryJob(jobId) {
+    const job = get().jobs.find((j) => j.id === jobId)
+    if (!job?.docId) {
+      get()._update(jobId, {
+        status: 'queued',
+        phase: 'queued',
+        progress: 0,
+        message: '',
+        errorReason: null,
+      })
+      get().start()
+      return
+    }
+    get()._update(jobId, {
+      status: 'processing',
+      phase: 'queued',
+      progress: 100,
+      message: 'Retrying',
+      chunksProcessed: 0,
+      chunksTotal: 0,
+      etaMs: null,
+      errorReason: null,
+    })
+    try {
+      await retryIngestion(job.docId)
+      get()._listenForTerminalEvent(jobId, job.docId)
+    } catch (err) {
+      const msg = err?.response?.data?.detail || err?.message || 'Retry failed'
+      get()._update(jobId, {
+        status: 'failed',
+        phase: 'failed',
+        message: msg,
+        errorReason: 'RetryError',
+      })
+    }
   },
 
   clearCompleted() {
     set((s) => ({
-      jobs: s.jobs.filter((j) => !['ready', 'failed'].includes(j.status)),
+      jobs: s.jobs.filter((j) => !TERMINAL_STATUSES.has(j.status)),
     }))
   },
 
@@ -71,7 +122,11 @@ export const useUploadStore = create((set, get) => ({
     if (!job) return
 
     try {
-      get()._update(jobId, { status: 'uploading', message: 'Creating session…' })
+      get()._update(jobId, {
+        status: 'uploading',
+        phase: 'uploading',
+        message: 'Preparing',
+      })
       const session = await createUploadSession({
         fileName: job.filename,
         mimeType: job.mimeType,
@@ -79,7 +134,7 @@ export const useUploadStore = create((set, get) => ({
         collection: job.collection,
       })
 
-      get()._update(jobId, { docId: session.doc_id, message: 'Uploading…' })
+      get()._update(jobId, { docId: session.doc_id, message: 'Uploading' })
       await putBytesToPresignedUrl({
         presignedUrl: session.presigned_url,
         file: job.file,
@@ -87,30 +142,88 @@ export const useUploadStore = create((set, get) => ({
         onProgress: (pct) => get()._update(jobId, { progress: pct }),
       })
 
-      get()._update(jobId, { progress: 100, message: 'Finalizing…' })
+      get()._update(jobId, {
+        progress: 100,
+        status: 'finalizing',
+        phase: 'finalizing',
+        message: 'Finalizing',
+      })
       await finalizeUpload(session.doc_id)
 
-      get()._update(jobId, { status: 'processing', message: 'Indexing…' })
-      await waitForTerminalEvent(session.doc_id, (patch) =>
-        get()._update(jobId, patch),
-      )
+      get()._update(jobId, {
+        status: 'processing',
+        phase: 'queued',
+        message: 'Queued',
+      })
+      // fire-and-forget — the drain loop must continue so subsequent uploads
+      // don't wait 140s for the worker to finish ingesting this one
+      get()._listenForTerminalEvent(jobId, session.doc_id)
     } catch (err) {
       const msg = err?.response?.data?.detail || err?.message || 'Upload failed'
-      get()._update(jobId, { status: 'failed', message: msg })
+      get()._update(jobId, {
+        status: 'failed',
+        phase: 'failed',
+        message: msg,
+        errorReason: 'UploadError',
+      })
     }
+  },
+
+  _listenForTerminalEvent(jobId, docId) {
+    waitForTerminalEvent(docId, (patch) => {
+      // job may have been cancelled (removeJob) while listening — skip if so
+      const exists = get().jobs.some((j) => j.id === jobId)
+      if (exists) get()._update(jobId, patch)
+    })
   },
 }))
 
-// Resolves once the SSE stream reports a terminal phase (ready or failed).
+// SSE consumer — translates backend phases to job state, computes ETA during
+// embedding, and resolves on any terminal phase.
 function waitForTerminalEvent(docId, applyPatch) {
   return new Promise((resolve) => {
+    const startedAt = Date.now()
+    let firstEmbedAt = null
+    let firstEmbedDone = 0
+
     const close = openDocumentEventStream({
       baseUrl: apiBaseUrl,
       docId,
       onEvent: (event) => {
-        if (event.phase === 'ready') {
+        const phase = event.phase
+        if (!phase) return
+
+        if (phase === 'embedding') {
+          const processed = event.chunks_processed ?? 0
+          const total = event.chunks_total ?? 0
+          // skip first batch from rolling average — onnx warmup skews it
+          if (firstEmbedAt === null) {
+            firstEmbedAt = Date.now()
+            firstEmbedDone = processed
+          }
+          let etaMs = null
+          if (processed > firstEmbedDone && total > processed) {
+            const elapsed = Date.now() - firstEmbedAt
+            const msPerChunk = elapsed / (processed - firstEmbedDone)
+            etaMs = Math.max(0, (total - processed) * msPerChunk)
+          }
+          applyPatch({
+            status: 'processing',
+            phase: 'embedding',
+            chunksProcessed: processed,
+            chunksTotal: total,
+            etaMs,
+            message: buildEmbeddingMessage(processed, total, etaMs),
+          })
+          return
+        }
+
+        if (phase === 'ready') {
           applyPatch({
             status: 'ready',
+            phase: 'ready',
+            etaMs: null,
+            durationMs: Date.now() - startedAt,
             message:
               event.chunks_count != null
                 ? `${event.chunks_count} chunks indexed`
@@ -118,16 +231,36 @@ function waitForTerminalEvent(docId, applyPatch) {
           })
           close()
           resolve()
-        } else if (event.phase === 'failed') {
+          return
+        }
+
+        if (phase === 'failed') {
           applyPatch({
             status: 'failed',
+            phase: 'failed',
+            etaMs: null,
+            errorReason: event.reason || 'IngestionError',
             message: event.message || 'Ingestion failed',
           })
           close()
           resolve()
-        } else if (event.phase) {
-          applyPatch({ message: event.phase })
+          return
         }
+
+        if (phase === 'duplicate') {
+          applyPatch({
+            status: 'duplicate',
+            phase: 'duplicate',
+            etaMs: null,
+            duplicateOf: event.duplicate_of || null,
+            message: 'Already in your library',
+          })
+          close()
+          resolve()
+          return
+        }
+
+        applyPatch({ phase, message: phaseLabel(phase) })
       },
       onError: () => {
         close()
@@ -135,4 +268,32 @@ function waitForTerminalEvent(docId, applyPatch) {
       },
     })
   })
+}
+
+function phaseLabel(phase) {
+  switch (phase) {
+    case 'processing': return 'Starting'
+    case 'downloading': return 'Reading'
+    case 'hashed': return 'Verifying'
+    case 'chunking': return 'Chunking'
+    default: return phase
+  }
+}
+
+function buildEmbeddingMessage(processed, total, etaMs) {
+  const base = total > 0 ? `Embedding ${processed}/${total}` : 'Embedding'
+  const eta = formatEta(etaMs)
+  return eta ? `${base} · ${eta}` : base
+}
+
+export function formatEta(etaMs) {
+  if (etaMs == null || etaMs < 3000) return ''
+  if (etaMs < 30000) return `~${Math.ceil(etaMs / 1000)}s left`
+  if (etaMs < 120000) return `~${Math.round(etaMs / 10000) * 10}s left`
+  return `~${Math.ceil(etaMs / 60000)} min left`
+}
+
+export function embeddingPercent(processed, total) {
+  if (!total || total <= 0) return null
+  return Math.min(100, Math.max(0, Math.round((processed / total) * 100)))
 }
